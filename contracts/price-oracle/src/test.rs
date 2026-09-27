@@ -1019,7 +1019,7 @@ fn test_price_volatility_increase() {
 }
 
 #[test]
-fn test_twap_buffer_limits_to_10_entries_and_calculates_average() {
+fn test_twap_ema_calculation() {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -1038,17 +1038,32 @@ fn test_twap_buffer_limits_to_10_entries_and_calculates_average() {
     // Initial TWAP is None
     assert_eq!(client.get_twap(&asset), None);
 
-    // Push 15 prices
-    for i in 1..=15 {
-        env.ledger()
-            .with_mut(|li| li.timestamp = 1_000_000 + i * 10);
-        client.set_price(&asset, &(i as i128 * 100), &6, &3600);
-    }
+    // First price should set initial EMA
+    env.ledger().with_mut(|li| {
+        li.timestamp = 1_000_000;
+        li.sequence = 100;
+    });
+    client.set_price(&asset, &1000, &6, &3600);
+    assert_eq!(client.get_twap(&asset), Some(1000));
 
-    // Since max entries is 10, it should only keep the last 10 entries.
-    // The prices kept should be: 600, 700, 800, 900, 1000, 1100, 1200, 1300, 1400, 1500
-    // Sum = 10500. Average = 1050
-    assert_eq!(client.get_twap(&asset), Some(1050));
+    // Next price in same ledger sequence (exceeds 2% delta)
+    // 2% of 1000 is 20. 1021 > 1020, so it should be rejected.
+    env.ledger().with_mut(|li| {
+        li.timestamp = 1_000_010;
+        li.sequence = 100;
+    });
+    // It should revert because it moves the EMA by more than 2% in the same ledger
+    let result = client.try_set_price(&asset, &2000, &6, &3600);
+    assert!(result.is_err());
+
+    // Next price in a new ledger sequence
+    env.ledger().with_mut(|li| {
+        li.timestamp = 1_000_020;
+        li.sequence = 101; // new ledger!
+    });
+    // Setting price to 2000. EMA = 0.15 * 2000 + 0.85 * 1000 = 300 + 850 = 1150
+    client.set_price(&asset, &2000, &6, &3600);
+    assert_eq!(client.get_twap(&asset), Some(1150));
 }
 
 #[test]
