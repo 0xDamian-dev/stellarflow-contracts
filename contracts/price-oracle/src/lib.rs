@@ -1309,21 +1309,32 @@ fn enforce_price_floor(env: &Env, asset: &Symbol, price: i128) -> Result<(), Con
     Ok(())
 }
 
-fn update_twap(env: &Env, asset: Symbol, price: i128, timestamp: u64) {
+fn update_twap(env: &Env, asset: Symbol, price: i128, _timestamp: u64) -> Result<(), ContractError> {
     let key = DataKey::Twap(asset);
-    let mut twap_buffer: soroban_sdk::Vec<(u64, i128)> = env
-        .storage()
-        .temporary()
-        .get(&key)
-        .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+    let current_twap: Option<(i128, u32)> = env.storage().temporary().get(&key);
+    let current_ledger = env.ledger().sequence();
 
-    twap_buffer.push_back((timestamp, price));
+    let new_ema = match current_twap {
+        Some((prev_ema, prev_ledger)) => {
+            let term1 = price.checked_mul(15).ok_or(ContractError::PriceMathOverflow)?;
+            let term2 = prev_ema.checked_mul(85).ok_or(ContractError::PriceMathOverflow)?;
+            let new_ema = term1.checked_add(term2).ok_or(ContractError::PriceMathOverflow)?.checked_div(100).ok_or(ContractError::PriceMathOverflow)?;
 
-    if twap_buffer.len() > 10 {
-        twap_buffer.pop_front();
-    }
+            if current_ledger == prev_ledger {
+                let delta = if new_ema > prev_ema { new_ema - prev_ema } else { prev_ema - new_ema };
+                let max_delta = prev_ema.checked_mul(2).ok_or(ContractError::PriceMathOverflow)?.checked_div(100).unwrap_or(0);
 
-    env.storage().temporary().set(&key, &twap_buffer);
+                if delta > max_delta {
+                    return Err(ContractError::PriceOutOfBounds);
+                }
+            }
+            new_ema
+        },
+        None => price,
+    };
+
+    env.storage().temporary().set(&key, &(new_ema, current_ledger));
+    Ok(())
 }
 
 #[contractimpl]
@@ -2125,7 +2136,7 @@ impl PriceOracle {
                     current.timestamp = now;
                     current.ledger_sequence = current_ledger;
                     storage.set(&key, &current);
-                    update_twap(&env, asset.clone(), val, now);
+                    update_twap(&env, asset.clone(), val, now)?;
                     event_topics::publish_price_update(&env, asset.clone(), current.price, now);
                     env.events().publish(
                         (Symbol::new(&env, "price_updated_event"),),
@@ -2148,7 +2159,7 @@ impl PriceOracle {
             };
 
             storage.set(&key, &price_data);
-            update_twap(&env, asset.clone(), normalized, now);
+            update_twap(&env, asset.clone(), normalized, now)?;
 
             if is_new_asset {
                 env.events()
@@ -2491,11 +2502,9 @@ impl PriceOracle {
         // Add the normalized price entry to the buffer, first checking it
         // falls within the ±15% deviation window against the rolling baseline.
         let twap_key = DataKey::Twap(asset.clone());
-        let twap_entries: soroban_sdk::Vec<(u64, i128)> = env
-            .storage()
-            .persistent()
-            .get(&twap_key)
-            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+        let twap_ema: Option<(i128, u32)> = env.storage().temporary().get(&twap_key);
+        let twap_price_opt = twap_ema.map(|(p, _)| p);
+        
         let candidate = soroban_sdk::vec![
             &env,
             PriceBufferEntry {
@@ -2504,7 +2513,7 @@ impl PriceOracle {
                 timestamp: env.ledger().timestamp(),
             }
         ];
-        let accepted = validation::filter_feeds_by_deviation(&twap_entries, candidate, &env);
+        let accepted = validation::filter_feeds_by_deviation(twap_price_opt, candidate, &env);
         if accepted.is_empty() {
             return Err(Error::FlashCrashDetected);
         }
@@ -2576,7 +2585,7 @@ impl PriceOracle {
 
         storage.set(&key, &price_data);
         storage.extend_ttl(&key, 10_000u32, 10_000u32);
-        update_twap(&env, asset.clone(), median_price, env.ledger().timestamp());
+        update_twap(&env, asset.clone(), median_price, env.ledger().timestamp())?;
 
         event_topics::publish_price_update(
             &env,
@@ -4335,22 +4344,8 @@ impl PriceOracle {
             return Err(ContractError::EmergencyHalted);
         }
         let key = DataKey::Twap(asset);
-        let twap_buffer: soroban_sdk::Vec<(u64, i128)> = match env.storage().temporary().get(&key) {
-            Some(buf) => buf,
-            None => return Ok(None),
-        };
-
-        let len = twap_buffer.len();
-        if len == 0 {
-            return Ok(None);
-        }
-
-        let mut sum: i128 = 0;
-        for (_, price) in twap_buffer.iter() {
-            sum = sum.checked_add(price).ok_or(ContractError::PriceMathOverflow)?;
-        }
-
-        Ok(sum.checked_div(len as i128))
+        let current_twap: Option<(i128, u32)> = env.storage().temporary().get(&key);
+        Ok(current_twap.map(|(price, _)| price))
     }
 
     /// Subscribe a contract to receive price update callbacks.
