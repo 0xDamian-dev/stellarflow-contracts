@@ -675,6 +675,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "key-recovery"
+version = "0.0.0"
+dependencies = [
+ "soroban-sdk",
+]
+
+[[package]]
 name = "ledger-time-helper"
 version = "0.0.0"
 dependencies = [
